@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  # FastAPI web service
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+      - ./storage:/app/storage
+    depends_on:
+      - redis
+      - mongodb
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MONGODB_URL=mongodb://mongodb:27017
+      - DATABASE_NAME=arx2_service
+      - STORAGE_DIR=storage
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Celery worker service
+  worker:
+    build: .
+    volumes:
+      - .:/app
+      - ./storage:/app/storage
+    depends_on:
+      - redis
+      - mongodb
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MONGODB_URL=mongodb://mongodb:27017
+      - DATABASE_NAME=arx2_service
+      - STORAGE_DIR=storage
+    command: celery -A celery_tasks.task_manager.celery_app worker --loglevel=info
+
+  # Redis service for Celery broker and task result backend
+  redis:
+    image: redis:6.2-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  # MongoDB service for data storage
+  mongodb:
+    image: mongo:5.0
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+
+volumes:
+  redis_data:
+  mongodb_data: 

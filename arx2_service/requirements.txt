@@ -1,0 +1,42 @@
+# Web framework and API
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+pydantic-settings
+
+# Background task processing
+celery
+redis
+
+# Database
+pymongo
+motor  # Async MongoDB driver for FastAPI
+
+# Authentication and security
+python-jose[cryptography]
+passlib[bcrypt]
+python-dotenv
+
+# Core ML dependencies (would use the actual ARX2 requirements in production)
+numpy
+torch
+pandas
+tqdm
+arxiv
+nltk
+scikit-learn
+transformers
+sentence-transformers
+
+# Utilities
+PyYAML
+psutil
+requests
+
+# Testing
+pytest
+pytest-asyncio
+pytest-timeout
+pytest-cov
+httpx  # For testing FastAPI applications 
