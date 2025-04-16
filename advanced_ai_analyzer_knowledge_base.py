@@ -156,41 +156,72 @@ class KnowledgeBase:
             self.paper_ids_in_index = []
     
     def _normalize_embedding(self, embedding):
-        """Normalize embedding to unit length for cosine similarity search via L2."""
+        """Normalize embedding vector to unit length with robust error handling.
+        
+        Args:
+            embedding: Vector to normalize, can be list, numpy array, or None
+            
+        Returns:
+            Normalized embedding as numpy array or zero vector if normalization fails
+        """
         if embedding is None:
-            return None
-        
-        # Convert to numpy array if it's not already
-        if isinstance(embedding, torch.Tensor):
-            embedding = embedding.detach().cpu().numpy()
+            logger.warning("Received None embedding, returning zero vector")
+            return np.zeros(self.embedding_dim, dtype=np.float32)
             
-        emb_array = np.array(embedding, dtype=np.float32)
-        
-        # Handle non-vector cases
-        if len(emb_array.shape) == 0:
-            emb_array = np.array([emb_array], dtype=np.float32)
-        elif len(emb_array.shape) > 1:
-            # If it's a batch of vectors or a 2D matrix, take the first one or average
-            emb_array = np.mean(emb_array, axis=0)
-        
-        # Reshape to ensure proper dimensionality
-        if emb_array.shape[0] != self.embedding_dim:
-            # If dimensions don't match, try to reshape or pad/truncate
-            if len(emb_array) > self.embedding_dim:
-                emb_array = emb_array[:self.embedding_dim]
-            else:
-                # Pad with zeros
-                padded = np.zeros(self.embedding_dim, dtype=np.float32)
-                padded[:len(emb_array)] = emb_array
-                emb_array = padded
+        # Handle string input (shouldn't happen but just in case)
+        if isinstance(embedding, str):
+            logger.warning(f"Received string embedding, returning zero vector: {embedding[:30]}...")
+            return np.zeros(self.embedding_dim, dtype=np.float32)
             
-            logger.warning(f"Embedding dimension mismatch. Reshaped from {len(embedding)} to {self.embedding_dim}.")
-        
-        # Normalize to unit length
-        norm = np.linalg.norm(emb_array)
-        if norm > 0:
-            return emb_array / norm
-        return emb_array  # Return as is if norm is 0
+        try:
+            # Convert to numpy array if it's not already
+            if isinstance(embedding, torch.Tensor):
+                embedding = embedding.detach().cpu().numpy()
+                
+            if not isinstance(embedding, np.ndarray):
+                try:
+                    embedding = np.array(embedding, dtype=np.float32)
+                except (TypeError, ValueError) as e:
+                    logger.error(f"Failed to convert embedding to numpy array: {str(e)}")
+                    return np.zeros(self.embedding_dim, dtype=np.float32)
+                
+            # Check for NaN or inf values
+            if np.isnan(embedding).any() or np.isinf(embedding).any():
+                logger.warning("Embedding contains NaN or infinite values, replacing with zeros")
+                embedding = np.nan_to_num(embedding, nan=0.0, posinf=0.0, neginf=0.0)
+                
+            # Make sure it's a vector
+            if embedding.ndim == 0:  # Scalar
+                logger.warning("Embedding is a scalar, converting to vector")
+                embedding = np.array([float(embedding)], dtype=np.float32)
+                # Pad with zeros to match dimension
+                if len(embedding) < self.embedding_dim:
+                    padding = np.zeros(self.embedding_dim - len(embedding), dtype=np.float32)
+                    embedding = np.concatenate([embedding, padding])
+            elif embedding.ndim > 1:  # Multi-dimensional
+                logger.warning(f"Embedding has unexpected shape {embedding.shape}, flattening")
+                embedding = embedding.flatten()
+                # Truncate or pad to match dimension
+                if len(embedding) > self.embedding_dim:
+                    embedding = embedding[:self.embedding_dim]
+                elif len(embedding) < self.embedding_dim:
+                    padding = np.zeros(self.embedding_dim - len(embedding), dtype=np.float32)
+                    embedding = np.concatenate([embedding, padding])
+                    
+            # Normalize to unit length with epsilon for numerical stability
+            epsilon = 1e-8
+            norm = np.linalg.norm(embedding)
+            
+            if norm < epsilon:
+                logger.warning("Embedding norm is too small, returning unnormalized")
+                return embedding
+            
+            # Use numpy's true_divide which handles division by zero safely
+            return np.true_divide(embedding, norm)
+            
+        except Exception as e:
+            logger.error(f"Error normalizing embedding: {str(e)}")
+            return np.zeros(self.embedding_dim, dtype=np.float32)
 
     def add_papers(self, processed_papers):
         """Add multiple papers to the knowledge base and FAISS index."""

@@ -1,0 +1,50 @@
+# Core dependencies
+numpy>=1.20.0
+scipy>=1.7.0
+matplotlib>=3.5.0
+pandas>=1.3.0
+tqdm>=4.62.0
+scikit-learn>=1.0.0
+networkx>=2.6.0
+joblib>=1.1.0
+
+# Deep learning
+torch>=1.10.0
+transformers>=4.15.0
+sentence-transformers>=2.2.0
+accelerate>=0.12.0
+
+# Data processing
+nltk>=3.6.5
+spacy>=3.2.0
+gensim>=4.1.2
+python-dateutil>=2.8.2
+beautifulsoup4>=4.10.0
+lxml>=4.6.0
+
+# Visualization
+seaborn>=0.11.2
+plotly>=5.5.0
+
+# Monitoring and system utilities
+psutil>=5.9.0
+GPUtil>=1.4.0
+tensorboard>=2.8.0
+
+# File handling and I/O
+jsonlines>=2.0.0
+PyYAML>=6.0
+h5py>=3.6.0
+zarr>=2.10.0
+
+# Logging and experiment tracking
+mlflow>=1.23.0
+wandb>=0.12.10  # Optional, uncomment if using Weights & Biases
+
+# Web access
+requests>=2.27.0
+aiohttp>=3.8.0
+
+# Scientific computing
+sympy>=1.9.0
+numba>=0.55.0  # For optimized numerical operations 

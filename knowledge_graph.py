@@ -13,378 +13,788 @@ import os
 from tqdm import tqdm
 import community as community_louvain
 import scipy.sparse
+import json
+import logging
+import math
+import itertools
+from scipy.cluster.hierarchy import linkage, fcluster
+from sklearn.metrics.pairwise import cosine_similarity
+from utils.embedding_manager import EmbeddingManager
 
-class KnowledgeGraph:
-    """A graph representation of concepts and their relationships in the knowledge base"""
+logger = logging.getLogger(__name__)
+
+class EnhancedKnowledgeGraph:
+    """Enhanced knowledge graph with hierarchical concept organization and advanced relation detection"""
     
-    def __init__(self, knowledge_base):
+    def __init__(self, knowledge_base=None):
         self.kb = knowledge_base
-        self.graph = nx.Graph()
-        self.concept_embeddings = {}
-        self.community_map = {}
-        self.concept_importance = {}
-        self.relation_types = ['co_occurrence', 'semantic_similarity', 'citation_link']
-        self.adj_matrix = None
-        self.concept_index = {}
+        self.graph = nx.DiGraph()
+        self.concept_embedding_cache = {}
+        self.relation_types = {
+            'is_a': 0,
+            'part_of': 1,
+            'similar_to': 2,
+            'prerequisite': 3,
+            'application': 4,
+            'variation_of': 5,
+            'contrasts_with': 6,
+            'evaluates': 7,
+            'introduces': 8,
+            'implements': 9,
+            'extends': 10
+        }
         
-        # Create graph directory
-        self.graph_dir = os.path.join(CONFIG['models_dir'], 'knowledge_graph')
-        os.makedirs(self.graph_dir, exist_ok=True)
+        # Mapping of relation ID to label
+        self.relation_labels = {v: k for k, v in self.relation_types.items()}
         
-    def build_graph(self, papers):
-        """Build graph incrementally with sparse representations"""
-        logger.info("Building knowledge graph from knowledge base")
+        # Initialize embedding manager for concept embeddings
+        self.embedding_manager = EmbeddingManager()
         
-        # Use sparse matrices for large graphs
-        self.adj_matrix = scipy.sparse.lil_matrix((len(self.kb.concepts), len(self.kb.concepts)))
+        # Cache for computed metrics
+        self._metrics_cache = {}
         
-        # Create concept index
-        self.concept_index = {concept: i for i, concept in enumerate(self.kb.concepts)}
+        # Track hierarchy of concepts
+        self.concept_hierarchy = {}
+        self.concept_clusters = {}
         
-        # Process papers in chunks
-        for i in range(0, len(papers), 1000):
-            chunk = papers[i:i+1000]
-            for paper in chunk:
-                # Only store top 20 concepts per paper to reduce edges
-                concepts = sorted(paper['concepts'], key=lambda x: x['score'], reverse=True)[:20]
-                
-                # Add concepts as nodes
-                for concept in concepts:
-                    if concept not in self.graph:
-                        self.graph.add_node(concept, weight=1)
-                    else:
-                        self.graph.nodes[concept]['weight'] += 1
-                
-                # Track concept co-occurrence
-                co_occurrence = defaultdict(Counter)
-                
-                # Build co-occurrence edges
-                for j, concept1 in enumerate(concepts):
-                    for concept2 in concepts[j+1:]:
-                        co_occurrence[concept1][concept2] += 1
-                        co_occurrence[concept2][concept1] += 1
-                
-                # Add edges with weights based on co-occurrence
-                for concept1, related in co_occurrence.items():
-                    for concept2, weight in related.items():
-                        if weight >= 2:  # Only add edges with multiple co-occurrences
-                            if self.graph.has_edge(concept1, concept2):
-                                self.graph[concept1][concept2]['weight'] += weight
-                            else:
-                                self.graph.add_edge(concept1, concept2, 
-                                                  weight=weight,
-                                                  relation='co_occurrence')
+        # Track research frontiers
+        self.research_frontiers = []
+        
+        # Core concept dictionary
+        self.core_concepts = {}
+        
+        # Temporal evolution tracking
+        self.concept_evolution = defaultdict(list)
+        
+    def build_graph_from_knowledge_base(self):
+        """Build a directed knowledge graph from the knowledge base papers and concepts"""
+        if not self.kb:
+            logger.error("No knowledge base provided to build graph")
+            return False
             
-            # Periodically prune weak connections
-            if i % 5000 == 0:
-                self._prune_weak_edges(threshold=0.1)
+        logger.info(f"Building knowledge graph from {len(self.kb.papers)} papers and {len(self.kb.concept_index)} concepts")
         
-        # Add semantic similarity edges if we have concept embeddings
-        if hasattr(self.kb, 'concept_embeddings') and self.kb.concept_embeddings:
-            logger.info("Adding semantic similarity edges based on concept embeddings")
-            concept_embeddings = {}
-            
-            # Get embeddings for filtered concepts
-            for concept in self.kb.concepts:
-                if concept in self.kb.concept_embeddings:
-                    concept_embeddings[concept] = self.kb.concept_embeddings[concept]
-            
-            # Calculate cosine similarity between concepts
-            similarity_edges = 0
-            for concept1 in tqdm(concept_embeddings.keys(), desc="Calculating similarities"):
-                emb1 = concept_embeddings[concept1]
-                
-                # Find top 5 similar concepts
-                similarities = []
-                for concept2, emb2 in concept_embeddings.items():
-                    if concept1 != concept2:
-                        sim = np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2))
-                        similarities.append((concept2, sim))
-                
-                # Add edges for top similar concepts
-                for concept2, sim in sorted(similarities, key=lambda x: x[1], reverse=True)[:5]:
-                    if sim > 0.7:  # Only add high similarity edges
-                        if self.graph.has_edge(concept1, concept2):
-                            self.graph[concept1][concept2]['weight'] += sim
-                        else:
-                            self.graph.add_edge(concept1, concept2, 
-                                              weight=sim,
-                                              relation='semantic_similarity')
-                        similarity_edges += 1
-            
-            logger.info(f"Added {similarity_edges} semantic similarity edges to knowledge graph")
+        # Clear existing graph
+        self.graph = nx.DiGraph()
         
-        # Add citation link edges from paper citations
-        if hasattr(self.kb, 'citation_network') and self.kb.citation_network:
-            logger.info("Adding citation link edges based on citation network")
-            citation_edges = 0
+        # Add all concepts as nodes
+        for concept in self.kb.concept_index:
+            self.graph.add_node(concept, type='concept', papers=self.kb.concept_index[concept])
+        
+        # Add papers as nodes
+        for paper_id, paper in self.kb.papers.items():
+            self.graph.add_node(
+                paper_id, 
+                type='paper',
+                title=paper.get('title', 'Unknown'),
+                authors=paper.get('authors', []),
+                published=paper.get('published', ''),
+                concepts=paper.get('concepts', [])
+            )
             
-            # Track which concepts are mentioned in which papers
-            concept_to_papers = defaultdict(set)
-            for paper_id, paper in self.kb.papers.items():
-                if 'concepts' in paper and paper['concepts']:
-                    for concept in paper['concepts']:
-                        if concept in self.kb.concepts:
-                            concept_to_papers[concept].add(paper_id)
-            
-            # Connect concepts in papers that cite each other
-            for paper_id, paper in tqdm(self.kb.papers.items(), desc="Processing citations"):
-                if 'citations' in paper and paper['citations']:
-                    # Get concepts in this paper
-                    source_concepts = {c for c in paper.get('concepts', []) if c in self.kb.concepts}
+            # Add edges from papers to concepts
+            for concept in paper.get('concepts', []):
+                if concept in self.graph:
+                    self.graph.add_edge(paper_id, concept, type='has_concept', weight=1.0)
+        
+        # Add citation relationships if available
+        if hasattr(self.kb, 'citation_graph'):
+            for citing_id, cited_ids in self.kb.citation_graph.items():
+                for cited_id in cited_ids:
+                    if citing_id in self.graph and cited_id in self.graph:
+                        self.graph.add_edge(citing_id, cited_id, type='cites', weight=1.0)
+        
+        # Add concept relationships from knowledge base
+        if hasattr(self.kb, 'concept_relations'):
+            for source_concept, relations in self.kb.concept_relations.items():
+                for relation in relations:
+                    target_concept = relation.get('target')
+                    relation_type = relation.get('relation')
+                    confidence = relation.get('confidence', 0.5)
                     
-                    # For each cited paper
-                    for cited_id in paper['citations']:
-                        if cited_id in self.kb.papers:
-                            # Get concepts in cited paper
-                            cited_concepts = {c for c in self.kb.papers[cited_id].get('concepts', []) 
-                                            if c in self.kb.concepts}
-                            
-                            # Connect concepts across citing-cited papers
-                            for src_concept in source_concepts:
-                                for dst_concept in cited_concepts:
-                                    if src_concept != dst_concept:
-                                        # Add edge or increase weight if exists
-                                        if self.graph.has_edge(src_concept, dst_concept):
-                                            self.graph[src_concept][dst_concept]['weight'] += 1
-                                        else:
-                                            self.graph.add_edge(src_concept, dst_concept,
-                                                              weight=1,
-                                                              relation='citation_link')
-                                            citation_edges += 1
-            
-            logger.info(f"Added {citation_edges} citation link edges to knowledge graph")
+                    if source_concept in self.graph and target_concept in self.graph:
+                        self.graph.add_edge(
+                            source_concept, 
+                            target_concept, 
+                            type=relation_type, 
+                            weight=confidence
+                        )
         
-        # Calculate node centrality to identify important concepts
-        logger.info("Calculating concept importance using PageRank")
-        self.concept_importance = nx.pagerank(self.graph, weight='weight')
+        # Extend with detected relationships between concepts
+        self._detect_concept_relationships()
         
-        # Identify communities using Louvain method
-        logger.info("Identifying concept communities in knowledge graph")
-        self.community_map = community_louvain.best_partition(self.graph, weight='weight')
+        # Build concept hierarchy
+        self._build_concept_hierarchy()
         
-        # Count communities
-        community_counts = Counter(self.community_map.values())
-        logger.info(f"Identified {len(community_counts)} communities in knowledge graph")
+        # Identify key research areas
+        self._identify_research_frontiers()
         
-        # Save graph
-        self.save_graph()
-        
+        logger.info(f"Built knowledge graph with {len(self.graph.nodes)} nodes and {len(self.graph.edges)} edges")
         return True
     
-    def _prune_weak_edges(self, threshold=0.1):
-        """Prune weak edges from the graph"""
-        logger.info("Pruning weak edges from knowledge graph")
-        
-        # Remove edges with weights below threshold
-        weak_edges = [(u, v) for u, v, d in self.graph.edges(data=True) if d['weight'] < threshold]
-        self.graph.remove_edges_from(weak_edges)
-        
-        logger.info(f"Removed {len(weak_edges)} weak edges from knowledge graph")
-    
-    def get_concept_communities(self, top_n=10):
-        """Get the most important concepts in each community"""
-        if not self.community_map or not self.concept_importance:
-            logger.warning("Knowledge graph not built or no communities identified")
-            return []
-        
-        # Group concepts by community
-        community_concepts = defaultdict(list)
-        for concept, community_id in self.community_map.items():
-            importance = self.concept_importance.get(concept, 0)
-            community_concepts[community_id].append((concept, importance))
-        
-        # Get top concepts in each community
-        top_communities = []
-        for community_id, concepts in community_concepts.items():
-            # Sort by importance
-            sorted_concepts = sorted(concepts, key=lambda x: x[1], reverse=True)
+    def _get_concept_embedding(self, concept):
+        """Get embedding for a concept, with caching"""
+        if concept in self.concept_embedding_cache:
+            return self.concept_embedding_cache[concept]
             
-            # Get top concepts
-            top_concepts = [c[0] for c in sorted_concepts[:top_n]]
-            
-            # Only include communities with at least 3 concepts
-            if len(top_concepts) >= 3:
-                community_size = len(concepts)
-                avg_importance = sum(c[1] for c in concepts) / max(1, community_size)
-                
-                top_communities.append({
-                    'id': community_id,
-                    'size': community_size,
-                    'importance': avg_importance,
-                    'concepts': top_concepts
-                })
-        
-        # Sort communities by importance
-        sorted_communities = sorted(top_communities, key=lambda x: x['importance'], reverse=True)
-        
-        return sorted_communities
+        # Generate embedding for concept
+        embedding = self.embedding_manager.get_embedding_for_text(concept)
+        self.concept_embedding_cache[concept] = embedding
+        return embedding
     
-    def get_related_concepts(self, concept, relation_type=None, limit=10):
-        """Get concepts related to the given concept"""
-        if not self.graph.has_node(concept):
-            return []
+    def _detect_concept_relationships(self):
+        """Detect relationships between concepts using multiple methods:
+        1. Co-occurrence in papers
+        2. Semantic similarity
+        3. Hierarchical patterns (is-a, part-of)
+        4. Causal and prerequisite relationships
+        """
+        logger.info("Detecting concept relationships")
         
-        related = []
-        for neighbor, edge_data in self.graph[concept].items():
-            if relation_type is None or edge_data.get('relation') == relation_type:
-                related.append({
-                    'concept': neighbor,
-                    'weight': edge_data.get('weight', 1.0),
-                    'relation': edge_data.get('relation', 'unknown')
-                })
+        # Get all concepts
+        concepts = [node for node, attr in self.graph.nodes(data=True) if attr.get('type') == 'concept']
         
-        # Sort by weight (strength of relation)
-        related.sort(key=lambda x: x['weight'], reverse=True)
-        
-        return related[:limit]
-    
-    def get_concept_importance(self, limit=20):
-        """Get the most important concepts in the knowledge graph"""
-        if not self.concept_importance:
-            return []
-        
-        # Sort concepts by importance
-        sorted_concepts = sorted(self.concept_importance.items(), key=lambda x: x[1], reverse=True)
-        
-        return [{'concept': c[0], 'importance': c[1]} for c in sorted_concepts[:limit]]
-    
-    def get_concept_path(self, source, target, max_length=5):
-        """Find the shortest path between two concepts"""
-        if not self.graph.has_node(source) or not self.graph.has_node(target):
-            return []
-        
-        try:
-            path = nx.shortest_path(self.graph, source=source, target=target, weight='weight')
-            
-            # Limit path length
-            if len(path) > max_length:
-                return []
-            
-            # Get edge details
-            path_with_details = []
-            for i in range(len(path) - 1):
-                edge_data = self.graph[path[i]][path[i+1]]
-                path_with_details.append({
-                    'source': path[i],
-                    'target': path[i+1],
-                    'weight': edge_data.get('weight', 1.0),
-                    'relation': edge_data.get('relation', 'unknown')
-                })
-            
-            return path_with_details
-        except nx.NetworkXNoPath:
-            return []
-    
-    def save_graph(self):
-        """Save the knowledge graph to a file"""
-        graph_file = os.path.join(self.graph_dir, 'knowledge_graph.pkl')
-        with open(graph_file, 'wb') as f:
-            pickle.dump({
-                'graph': self.graph,
-                'concept_importance': self.concept_importance,
-                'community_map': self.community_map
-            }, f)
-        logger.info(f"Saved knowledge graph to {graph_file}")
-    
-    def load_graph(self):
-        """Load the knowledge graph from a file"""
-        graph_file = os.path.join(self.graph_dir, 'knowledge_graph.pkl')
-        if os.path.exists(graph_file):
-            try:
-                with open(graph_file, 'rb') as f:
-                    data = pickle.load(f)
-                    self.graph = data['graph']
-                    self.concept_importance = data['concept_importance']
-                    self.community_map = data['community_map']
-                logger.info(f"Loaded knowledge graph from {graph_file}")
-                return True
-            except Exception as e:
-                logger.error(f"Error loading knowledge graph: {e}")
-        
-        return False
-    
-    def visualize_graph(self, output_file=None, max_nodes=100):
-        """Visualize the knowledge graph"""
-        if not self.graph:
-            logger.warning("Knowledge graph not built")
+        if not concepts:
+            logger.warning("No concepts in graph to detect relationships")
             return
+            
+        # 1. Co-occurrence analysis
+        concept_cooccurrence = defaultdict(lambda: defaultdict(int))
         
-        # Create a subgraph with limited nodes for visualization
-        if len(self.graph) > max_nodes:
-            # Get top concepts by importance
-            top_concepts = sorted(self.concept_importance.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
-            top_concept_ids = [c[0] for c in top_concepts]
-            subgraph = self.graph.subgraph(top_concept_ids)
-        else:
-            subgraph = self.graph
+        # Count co-occurring concepts in papers
+        for paper_id, paper in self.kb.papers.items():
+            paper_concepts = paper.get('concepts', [])
+            
+            # Count pairwise co-occurrences
+            for i, concept1 in enumerate(paper_concepts):
+                for concept2 in paper_concepts[i+1:]:
+                    concept_cooccurrence[concept1][concept2] += 1
+                    concept_cooccurrence[concept2][concept1] += 1
         
-        # Set up the plot
-        plt.figure(figsize=(12, 12))
-        
-        # Use spring layout for positioning
-        pos = nx.spring_layout(subgraph, k=0.1, iterations=50)
-        
-        # Get node sizes based on importance
-        node_sizes = [self.concept_importance.get(node, 0.1) * 5000 for node in subgraph.nodes()]
-        
-        # Get node colors based on community
-        node_colors = [self.community_map.get(node, 0) for node in subgraph.nodes()]
-        
-        # Draw nodes
-        nx.draw_networkx_nodes(subgraph, pos, 
-                              node_size=node_sizes,
-                              node_color=node_colors, 
-                              alpha=0.8,
-                              cmap=plt.cm.tab20)
-        
-        # Draw edges
-        nx.draw_networkx_edges(subgraph, pos, width=0.5, alpha=0.5)
-        
-        # Draw labels for top importance nodes
-        top_n = min(20, len(subgraph))
-        top_nodes = sorted([(n, self.concept_importance.get(n, 0)) 
-                          for n in subgraph.nodes()], 
-                          key=lambda x: x[1], 
-                          reverse=True)[:top_n]
-        labels = {node: node for node, _ in top_nodes}
-        nx.draw_networkx_labels(subgraph, pos, labels=labels, font_size=8)
-        
-        plt.title(f"AI Research Knowledge Graph (showing {len(subgraph)} concepts)")
-        plt.axis('off')
-        
-        # Save or show
-        if output_file:
-            plt.savefig(output_file, dpi=300, bbox_inches='tight')
-            logger.info(f"Saved knowledge graph visualization to {output_file}")
-        else:
-            output_file = os.path.join(self.graph_dir, 'knowledge_graph.png')
-            plt.savefig(output_file, dpi=300, bbox_inches='tight')
-            logger.info(f"Saved knowledge graph visualization to {output_file}")
-        
-        plt.close()
-    
-    def get_adjacency_matrix(self, concepts=None):
-        """Get adjacency matrix representation of the graph for model input"""
-        if concepts is None:
-            # Use all concepts
-            concepts = list(self.graph.nodes())
-        
-        # Create mapping of concepts to indices
-        concept_to_idx = {concept: i for i, concept in enumerate(concepts)}
-        
-        # Initialize adjacency matrix
-        n = len(concepts)
-        adj_matrix = np.zeros((n, n), dtype=np.float32)
-        
-        # Fill adjacency matrix
-        for i, concept1 in enumerate(concepts):
-            if concept1 not in self.graph:
+        # Add high-confidence co-occurrence edges (normalized by concept frequency)
+        for concept1, cooccurrences in concept_cooccurrence.items():
+            concept1_count = len(self.kb.concept_index.get(concept1, []))
+            if concept1_count == 0:
                 continue
                 
-            for concept2, edge_data in self.graph[concept1].items():
-                if concept2 in concept_to_idx:
-                    j = concept_to_idx[concept2]
-                    adj_matrix[i, j] = edge_data.get('weight', 1.0)
+            for concept2, count in cooccurrences.items():
+                concept2_count = len(self.kb.concept_index.get(concept2, []))
+                if concept2_count == 0:
+                    continue
+                    
+                # Normalize by concept frequency
+                pmi = math.log((count * len(self.kb.papers)) / (concept1_count * concept2_count))
+                
+                # Only add strong relationships (PMI > 0)
+                if pmi > 0:
+                    confidence = min(1.0, pmi / 5.0)  # Normalize to [0,1]
+                    
+                    # Add as similar_to relationship
+                    self.graph.add_edge(
+                        concept1,
+                        concept2,
+                        type='similar_to',
+                        weight=confidence,
+                        method='co-occurrence'
+                    )
         
-        return torch.FloatTensor(adj_matrix), concept_to_idx
+        # 2. Semantic similarity using embeddings
+        # Process in batches to avoid memory issues
+        concept_batches = [concepts[i:i+100] for i in range(0, len(concepts), 100)]
+        
+        for batch in concept_batches:
+            # Get embeddings for this batch
+            embeddings = np.array([self._get_concept_embedding(concept) for concept in batch])
+            
+            # Compute pairwise similarities
+            similarities = cosine_similarity(embeddings)
+            
+            # Add edges for highly similar concepts
+            for i, concept1 in enumerate(batch):
+                for j, concept2 in enumerate(batch):
+                    if i != j and similarities[i, j] > 0.7:  # Threshold for similarity
+                        self.graph.add_edge(
+                            concept1,
+                            concept2,
+                            type='similar_to',
+                            weight=similarities[i, j],
+                            method='semantic'
+                        )
+        
+        # 3. Detect hierarchical patterns (is-a, part-of)
+        for concept1 in concepts:
+            for concept2 in concepts:
+                if concept1 == concept2:
+                    continue
+                
+                # Check for "is-a" relationships
+                if f"{concept1} is a {concept2}" in concept1 or f"{concept1} is an {concept2}" in concept1:
+                    self.graph.add_edge(
+                        concept1,
+                        concept2,
+                        type='is_a',
+                        weight=0.9,
+                        method='pattern'
+                    )
+                
+                # Check for "part-of" relationships
+                if f"{concept1} of {concept2}" in concept1 or f"{concept1} in {concept2}" in concept1:
+                    self.graph.add_edge(
+                        concept1,
+                        concept2,
+                        type='part_of',
+                        weight=0.8,
+                        method='pattern'
+                    )
+        
+        # 4. Causal and prerequisite relationships based on temporal analysis
+        paper_dates = {}
+        for paper_id, paper in self.kb.papers.items():
+            if 'published' in paper and paper['published']:
+                try:
+                    paper_dates[paper_id] = paper['published']
+                except:
+                    continue
+        
+        # For each concept, find its first mention date
+        concept_first_dates = {}
+        for concept in concepts:
+            paper_ids = self.kb.concept_index.get(concept, [])
+            concept_papers_dates = [paper_dates.get(pid) for pid in paper_ids if pid in paper_dates]
+            if concept_papers_dates:
+                concept_first_dates[concept] = min(concept_papers_dates)
+        
+        # Analyze temporal patterns to detect prerequisites
+        for concept1, date1 in concept_first_dates.items():
+            for concept2, date2 in concept_first_dates.items():
+                if concept1 == concept2:
+                    continue
+                
+                # If concept1 appeared significantly before concept2
+                if date1 < date2:
+                    # Check co-occurrence to ensure they're related
+                    if concept_cooccurrence[concept1][concept2] > 0:
+                        self.graph.add_edge(
+                            concept1,
+                            concept2,
+                            type='prerequisite',
+                            weight=0.6,
+                            method='temporal'
+                        )
+        
+        logger.info(f"Added {sum(1 for e in self.graph.edges(data=True) if e[2].get('method') in ['co-occurrence', 'semantic', 'pattern', 'temporal'])} relationship edges between concepts")
+    
+    def _build_concept_hierarchy(self):
+        """Build a hierarchical organization of concepts using clustering and graph metrics"""
+        logger.info("Building concept hierarchy")
+        
+        # Get all concepts
+        concepts = [node for node, attr in self.graph.nodes(data=True) if attr.get('type') == 'concept']
+        
+        if not concepts:
+            logger.warning("No concepts in graph to build hierarchy")
+            return
+        
+        # 1. Get concept embeddings
+        concept_embeddings = {}
+        for concept in concepts:
+            concept_embeddings[concept] = self._get_concept_embedding(concept)
+        
+        # Convert to numpy array for clustering
+        embedding_matrix = np.array([concept_embeddings[c] for c in concepts])
+        
+        # 2. Hierarchical clustering
+        try:
+            # Compute linkage matrix
+            Z = linkage(embedding_matrix, method='ward')
+            
+            # Form flat clusters with automatic threshold determination
+            max_clusters = min(20, len(concepts) // 5) if len(concepts) > 20 else 5
+            labels = fcluster(Z, max_clusters, criterion='maxclust')
+            
+            # Store clusters
+            clusters = defaultdict(list)
+            for concept, label in zip(concepts, labels):
+                clusters[label].append(concept)
+            
+            # Find the most representative concept for each cluster
+            for cluster_id, cluster_concepts in clusters.items():
+                # Calculate centrality for each concept in the subgraph
+                subgraph = self.graph.subgraph(cluster_concepts)
+                centrality = nx.eigenvector_centrality_numpy(subgraph.to_undirected(), max_iter=1000, tol=1e-06)
+                
+                # Sort by centrality
+                sorted_concepts = sorted(centrality.items(), key=lambda x: x[1], reverse=True)
+                
+                if sorted_concepts:
+                    cluster_name = sorted_concepts[0][0]
+                    self.concept_clusters[cluster_name] = cluster_concepts
+                    
+                    # Create hierarchy entries for each concept in cluster
+                    for concept in cluster_concepts:
+                        self.concept_hierarchy[concept] = {
+                            'cluster': cluster_id,
+                            'cluster_name': cluster_name,
+                            'centrality': centrality.get(concept, 0)
+                        }
+                        
+                        # Add hierarchical edge in graph
+                        if concept != cluster_name:
+                            self.graph.add_edge(
+                                concept,
+                                cluster_name,
+                                type='part_of',
+                                weight=0.7,
+                                method='hierarchical'
+                            )
+            
+            logger.info(f"Created {len(clusters)} concept clusters")
+            
+        except Exception as e:
+            logger.error(f"Error in hierarchical clustering: {e}")
+    
+    def _identify_research_frontiers(self):
+        """Identify emerging research frontiers based on multiple indicators:
+        1. Recent growth in publications
+        2. Citation patterns
+        3. Network structure (betweenness centrality)
+        4. Topic novelty
+        """
+        logger.info("Identifying research frontiers")
+        
+        # Get concepts and papers
+        concepts = [node for node, attr in self.graph.nodes(data=True) if attr.get('type') == 'concept']
+        papers = self.kb.papers
+        
+        if not concepts or not papers:
+            logger.warning("Not enough data to identify research frontiers")
+            return
+        
+        # Calculate concept growth rate (recent papers / older papers)
+        concept_growth = {}
+        
+        # Get current year and define horizon
+        from datetime import datetime
+        current_year = datetime.now().year
+        recent_horizon = current_year - 2  # Papers from last 2 years
+        
+        for concept in concepts:
+            paper_ids = self.kb.concept_index.get(concept, [])
+            
+            recent_count = 0
+            older_count = 0
+            
+            for paper_id in paper_ids:
+                if paper_id in papers:
+                    paper = papers[paper_id]
+                    if 'published' in paper and paper['published']:
+                        try:
+                            # Extract year from ISO format date
+                            year = int(paper['published'][:4])
+                            if year >= recent_horizon:
+                                recent_count += 1
+                            else:
+                                older_count += 1
+                        except:
+                            older_count += 1
+            
+            # Calculate growth rate
+            if older_count > 0:
+                growth_rate = recent_count / older_count
+            else:
+                growth_rate = recent_count if recent_count > 0 else 0
+                
+            concept_growth[concept] = growth_rate
+        
+        # Calculate betweenness centrality to find concepts bridging different areas
+        concept_betweenness = {}
+        try:
+            # Use only the concept subgraph
+            concept_subgraph = self.graph.subgraph(concepts).to_undirected()
+            betweenness = nx.betweenness_centrality(concept_subgraph)
+            concept_betweenness = betweenness
+        except Exception as e:
+            logger.error(f"Error calculating betweenness: {e}")
+            # Fallback: assign zero betweenness
+            concept_betweenness = {concept: 0 for concept in concepts}
+        
+        # Calculate novelty score based on uniqueness of concept combinations
+        concept_novelty = {}
+        for concept in concepts:
+            paper_ids = self.kb.concept_index.get(concept, [])
+            related_concepts = set()
+            
+            for paper_id in paper_ids:
+                if paper_id in papers:
+                    related_concepts.update(papers[paper_id].get('concepts', []))
+            
+            # Remove self from related concepts
+            if concept in related_concepts:
+                related_concepts.remove(concept)
+            
+            # Novelty is inversely proportional to number of related concepts
+            if related_concepts:
+                concept_novelty[concept] = 1 / math.sqrt(len(related_concepts))
+            else:
+                concept_novelty[concept] = 1.0  # Maximum novelty for isolated concepts
+        
+        # Combine metrics to calculate frontier score
+        frontier_scores = {}
+        for concept in concepts:
+            growth = concept_growth.get(concept, 0)
+            betweenness = concept_betweenness.get(concept, 0)
+            novelty = concept_novelty.get(concept, 0)
+            
+            # Weighted combination
+            frontier_score = (0.6 * growth) + (0.25 * betweenness) + (0.15 * novelty)
+            frontier_scores[concept] = frontier_score
+        
+        # Sort concepts by frontier score
+        sorted_frontiers = sorted(frontier_scores.items(), key=lambda x: x[1], reverse=True)
+        
+        # Take top N as research frontiers
+        top_n = min(10, len(sorted_frontiers))
+        self.research_frontiers = [concept for concept, score in sorted_frontiers[:top_n]]
+        
+        # Store core concepts (high betweenness)
+        self.core_concepts = {concept: betweenness for concept, betweenness in concept_betweenness.items() 
+                             if betweenness > 0.01}  # Threshold for significance
+        
+        logger.info(f"Identified {len(self.research_frontiers)} research frontiers")
+        
+        # Store the frontier concepts with their scores for later reference
+        for concept, score in sorted_frontiers[:top_n]:
+            # Add to evolution tracking with current score
+            self.concept_evolution[concept].append({
+                'time': datetime.now().isoformat(),
+                'frontier_score': score,
+                'growth': concept_growth.get(concept, 0),
+                'betweenness': concept_betweenness.get(concept, 0),
+                'novelty': concept_novelty.get(concept, 0)
+            })
+            
+            # Add as node attribute
+            if concept in self.graph:
+                self.graph.nodes[concept]['frontier_score'] = score
+                self.graph.nodes[concept]['is_frontier'] = True
+    
+    def get_concept_importance(self, limit=None):
+        """Get concepts ranked by importance using PageRank
+        
+        Args:
+            limit (int, optional): Limit number of results
+            
+        Returns:
+            list: List of dictionaries with concept and importance score
+        """
+        # Check if we have a cached result
+        if 'concept_importance' in self._metrics_cache:
+            ranks = self._metrics_cache['concept_importance']
+        else:
+            # Calculate PageRank on the concept subgraph
+            concept_nodes = [node for node, attr in self.graph.nodes(data=True) if attr.get('type') == 'concept']
+            concept_subgraph = self.graph.subgraph(concept_nodes)
+            
+            try:
+                pagerank = nx.pagerank(concept_subgraph)
+                ranks = [(concept, score) for concept, score in pagerank.items()]
+                ranks.sort(key=lambda x: x[1], reverse=True)
+                
+                # Cache the result
+                self._metrics_cache['concept_importance'] = ranks
+            except:
+                # Fallback: use degree centrality
+                degree = nx.degree_centrality(concept_subgraph)
+                ranks = [(concept, score) for concept, score in degree.items()]
+                ranks.sort(key=lambda x: x[1], reverse=True)
+        
+        # Format the results
+        result = [{'concept': concept, 'importance': float(score)} for concept, score in ranks]
+        
+        # Limit if necessary
+        if limit is not None:
+            result = result[:limit]
+            
+        return result
+    
+    def get_related_concepts(self, concept, relation_type=None, min_weight=0.0):
+        """Get concepts related to a given concept
+        
+        Args:
+            concept (str): The concept to find relations for
+            relation_type (str, optional): Filter by specific relation type
+            min_weight (float, optional): Minimum weight threshold
+            
+        Returns:
+            list: List of related concepts with relation information
+        """
+        if concept not in self.graph:
+            return []
+            
+        related = []
+        
+        # Get outgoing edges
+        for _, target, data in self.graph.out_edges(concept, data=True):
+            if data.get('type') != 'has_concept' and self.graph.nodes[target].get('type') == 'concept':
+                if relation_type is None or data.get('type') == relation_type:
+                    if data.get('weight', 0) >= min_weight:
+                        related.append({
+                            'concept': target,
+                            'relation': data.get('type', 'related'),
+                            'weight': data.get('weight', 0.0),
+                            'direction': 'outgoing'
+                        })
+        
+        # Get incoming edges
+        for source, _, data in self.graph.in_edges(concept, data=True):
+            if data.get('type') != 'has_concept' and self.graph.nodes[source].get('type') == 'concept':
+                if relation_type is None or data.get('type') == relation_type:
+                    if data.get('weight', 0) >= min_weight:
+                        related.append({
+                            'concept': source,
+                            'relation': data.get('type', 'related'),
+                            'weight': data.get('weight', 0.0),
+                            'direction': 'incoming'
+                        })
+        
+        # Sort by weight
+        related.sort(key=lambda x: x['weight'], reverse=True)
+        return related
+    
+    def get_papers_for_concept(self, concept, limit=None):
+        """Get papers associated with a concept
+        
+        Args:
+            concept (str): The concept to find papers for
+            limit (int, optional): Limit number of results
+            
+        Returns:
+            list: List of paper IDs
+        """
+        if concept not in self.graph:
+            return []
+            
+        # Get papers directly from knowledge base
+        paper_ids = self.kb.concept_index.get(concept, [])
+        
+        # Sort by recency if dates available
+        sorted_papers = []
+        for paper_id in paper_ids:
+            if paper_id in self.kb.papers:
+                paper = self.kb.papers[paper_id]
+                published = paper.get('published', '')
+                sorted_papers.append((paper_id, published))
+        
+        # Sort by publication date (descending)
+        sorted_papers.sort(key=lambda x: x[1], reverse=True)
+        
+        # Get paper IDs only
+        paper_ids = [paper_id for paper_id, _ in sorted_papers]
+        
+        # Limit if necessary
+        if limit is not None:
+            paper_ids = paper_ids[:limit]
+            
+        return paper_ids
+    
+    def get_research_frontiers(self, limit=None):
+        """Get current research frontiers
+        
+        Args:
+            limit (int, optional): Limit number of results
+            
+        Returns:
+            list: List of frontier concepts with associated information
+        """
+        frontiers = []
+        
+        for concept in self.research_frontiers:
+            # Get related papers
+            paper_ids = self.get_papers_for_concept(concept, limit=5)
+            papers = []
+            
+            for paper_id in paper_ids:
+                if paper_id in self.kb.papers:
+                    papers.append({
+                        'id': paper_id,
+                        'title': self.kb.papers[paper_id].get('title', 'Unknown'),
+                        'published': self.kb.papers[paper_id].get('published', '')
+                    })
+            
+            # Get related concepts
+            related = self.get_related_concepts(concept, min_weight=0.4)
+            
+            # Get evolution data
+            evolution = self.concept_evolution.get(concept, [])
+            
+            frontiers.append({
+                'concept': concept,
+                'papers': papers,
+                'related_concepts': related,
+                'evolution': evolution,
+                'cluster': self.concept_hierarchy.get(concept, {}).get('cluster_name', '')
+            })
+        
+        # Limit if necessary
+        if limit is not None:
+            frontiers = frontiers[:limit]
+            
+        return frontiers
+    
+    def get_concept_clusters(self, limit=None):
+        """Get concept clusters with key related concepts
+        
+        Args:
+            limit (int, optional): Limit number of clusters
+            
+        Returns:
+            list: List of clusters with related concepts
+        """
+        clusters = []
+        
+        for cluster_name, concepts in self.concept_clusters.items():
+            # Get top concepts in this cluster by centrality
+            top_concepts = sorted(
+                [(c, self.concept_hierarchy.get(c, {}).get('centrality', 0)) for c in concepts],
+                key=lambda x: x[1],
+                reverse=True
+            )
+            
+            # Take top 5 concepts
+            top_concepts = [c[0] for c in top_concepts[:5]]
+            
+            clusters.append({
+                'name': cluster_name,
+                'concepts': top_concepts,
+                'size': len(concepts)
+            })
+        
+        # Sort by cluster size
+        clusters.sort(key=lambda x: x['size'], reverse=True)
+        
+        # Limit if necessary
+        if limit is not None:
+            clusters = clusters[:limit]
+            
+        return clusters
+    
+    def visualize(self, output_path=None, max_nodes=100):
+        """Visualize the knowledge graph
+        
+        Args:
+            output_path (str, optional): Path to save the visualization
+            max_nodes (int, optional): Maximum number of nodes to include
+            
+        Returns:
+            str: Path to the saved visualization or None if failed
+        """
+        if not output_path:
+            output_path = os.path.join(CONFIG.get('models_dir', '.'), 'knowledge_graph.png')
+            
+        try:
+            # Create a smaller subgraph for visualization
+            if len(self.graph) > max_nodes:
+                # Focus on frontiers and core concepts
+                key_concepts = set(self.research_frontiers + list(self.core_concepts.keys()))
+                
+                # Limit to max_nodes
+                if len(key_concepts) > max_nodes:
+                    key_concepts = list(key_concepts)[:max_nodes]
+                
+                # Create subgraph
+                subgraph = self.graph.subgraph(key_concepts)
+            else:
+                subgraph = self.graph
+            
+            # Set up layout
+            pos = nx.spring_layout(subgraph)
+            
+            # Set up figure
+            plt.figure(figsize=(12, 10))
+            
+            # Draw nodes
+            nx.draw_networkx_nodes(
+                subgraph, 
+                pos, 
+                node_size=[300 if node in self.research_frontiers else 100 for node in subgraph],
+                node_color=['red' if node in self.research_frontiers else 'blue' for node in subgraph],
+                alpha=0.7
+            )
+            
+            # Draw edges
+            nx.draw_networkx_edges(
+                subgraph, 
+                pos, 
+                width=[data.get('weight', 0.5) for _, _, data in subgraph.edges(data=True)],
+                alpha=0.5
+            )
+            
+            # Draw labels
+            nx.draw_networkx_labels(subgraph, pos, font_size=8)
+            
+            # Set title and save
+            plt.title(f"Knowledge Graph: {len(subgraph.nodes)} nodes, {len(subgraph.edges)} edges")
+            plt.axis('off')
+            plt.tight_layout()
+            plt.savefig(output_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            logger.info(f"Saved knowledge graph visualization to {output_path}")
+            return output_path
+        
+        except Exception as e:
+            logger.error(f"Error visualizing knowledge graph: {e}")
+            return None
+    
+    def export_graph(self, output_path=None):
+        """Export the knowledge graph to JSON format
+        
+        Args:
+            output_path (str, optional): Path to save the exported graph
+            
+        Returns:
+            str: Path to the saved file or None if failed
+        """
+        if not output_path:
+            output_path = os.path.join(CONFIG.get('models_dir', '.'), 'knowledge_graph.json')
+            
+        try:
+            # Create serializable representation
+            graph_data = {
+                'nodes': [],
+                'edges': [],
+                'frontiers': self.research_frontiers,
+                'clusters': [{'name': name, 'concepts': concepts[:10]} for name, concepts in self.concept_clusters.items()],
+                'metrics': {
+                    'nodes': len(self.graph.nodes),
+                    'edges': len(self.graph.edges),
+                    'frontiers': len(self.research_frontiers),
+                    'clusters': len(self.concept_clusters)
+                }
+            }
+            
+            # Add nodes
+            for node, attrs in self.graph.nodes(data=True):
+                node_data = {'id': node}
+                node_data.update({k: v for k, v in attrs.items() if isinstance(v, (str, int, float, bool, list, dict))})
+                graph_data['nodes'].append(node_data)
+            
+            # Add edges
+            for source, target, attrs in self.graph.edges(data=True):
+                edge_data = {
+                    'source': source,
+                    'target': target
+                }
+                edge_data.update({k: v for k, v in attrs.items() if isinstance(v, (str, int, float, bool, list, dict))})
+                graph_data['edges'].append(edge_data)
+            
+            # Save to file
+            with open(output_path, 'w') as f:
+                json.dump(graph_data, f, indent=2)
+                
+            logger.info(f"Exported knowledge graph to {output_path}")
+            return output_path
+            
+        except Exception as e:
+            logger.error(f"Error exporting knowledge graph: {e}")
+            return None

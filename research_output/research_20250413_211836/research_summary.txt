@@ -1,0 +1,19 @@
+Research Summary for: reinforcement learning deep neural networks
+Date: 20250413_211836
+Iterations: 5
+
+Research Frontiers:
+1. {'concept': 'learn', 'growth_rate': 0.0, 'citation_importance': 0.0, 'frequency': 259, 'cluster': [], 'papers': ['2108.11510', '2401.02349', '1909.04751', '1708.05866', '2106.10112'], 'importance': 0.16496815286624206}
+2. {'concept': 'network', 'growth_rate': 0.0, 'citation_importance': 0.0, 'frequency': 258, 'cluster': [], 'papers': ['2108.11510', '2401.02349', '1909.04751', '1708.05866', '2106.10112'], 'importance': 0.16433121019108282}
+3. {'concept': 'model', 'growth_rate': 0.0, 'citation_importance': 0.0, 'frequency': 249, 'cluster': [], 'papers': ['2108.11510', '1909.04751', '1708.05866', '2106.10112', '2009.07888'], 'importance': 0.1585987261146497}
+4. {'concept': 'learning', 'growth_rate': 0.0, 'citation_importance': 0.0, 'frequency': 237, 'cluster': [], 'papers': ['2108.11510', '2401.02349', '1909.04751', '1708.05866', '2106.10112'], 'importance': 0.15095541401273888}
+5. {'concept': 'neural network', 'growth_rate': 0.0, 'citation_importance': 0.0, 'frequency': 233, 'cluster': [], 'papers': ['2108.11510', '2401.02349', '1909.04751', '1708.05866', '2106.10112'], 'importance': 0.1484076433121019}
+6. {'concept': 'neural', 'growth_rate': 0.0, 'citation_importance': 0.0, 'frequency': 225, 'cluster': [], 'papers': ['2108.11510', '2401.02349', '1909.04751', '1708.05866', '2106.10112'], 'importance': 0.14331210191082802}
+7. {'concept': 'deep', 'growth_rate': 0.0, 'citation_importance': 0.0, 'frequency': 207, 'cluster': [], 'papers': ['2108.11510', '2401.02349', '1909.04751', '1708.05866', '2106.10112'], 'importance': 0.13184713375796178}
+8. {'concept': 'result', 'growth_rate': 0.0, 'citation_importance': 0.0, 'frequency': 191, 'cluster': [], 'papers': ['1909.04751', '2106.10112', '1609.03348', '2008.02708', '1912.03918'], 'importance': 0.12165605095541401}
+9. {'concept': 'training', 'growth_rate': 0.0, 'citation_importance': 0.0, 'frequency': 188, 'cluster': [], 'papers': ['2401.02349', '1909.04751', '2106.10112', '2008.02708', '1912.03918'], 'importance': 0.1197452229299363}
+10. {'concept': 'base', 'growth_rate': 0.0, 'citation_importance': 0.0, 'frequency': 182, 'cluster': [], 'papers': ['2108.11510', '2401.02349', '1909.04751', '1708.05866', '1609.03348'], 'importance': 0.1159235668789809}
+
+Total papers processed: 314
+Total concepts learned: 6228
+Execution time: 0h 29m 8s

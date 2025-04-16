@@ -1,0 +1,16 @@
+Crash Report - 2025-04-16 09:34:42
+Query: reinforcement learning deep neural networks
+Error: module 'knowledge_graph' has no attribute 'KnowledgeGraph'
+
+Traceback:
+Traceback (most recent call last):
+  File "/home/n3ros/Documents/workspace/arx2/run_advanced_mode.py", line 201, in main
+    engine = RecursiveResearchEngine(papers_dir=papers_dir, models_dir=models_dir)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/n3ros/Documents/workspace/arx2/advanced_ai_analyzer_engine.py", line 51, in __init__
+    self.knowledge_manager = KnowledgeManager(self)
+                             ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/n3ros/Documents/workspace/arx2/knowledge_manager.py", line 12, in __init__
+    self.kg = knowledge_graph.KnowledgeGraph(self.kb) # Initialize KG
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'knowledge_graph' has no attribute 'KnowledgeGraph'

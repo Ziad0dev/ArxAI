@@ -1,0 +1,48 @@
+# Core Dependencies
+torch>=2.0.0
+transformers>=4.28.0
+sentence-transformers>=2.2.2
+numpy>=1.23.0
+pandas>=1.5.0
+scipy>=1.10.0
+scikit-learn>=1.2.0
+tqdm>=4.64.0
+matplotlib>=3.6.0
+seaborn>=0.12.0
+networkx>=2.8.0
+
+faiss-gpu-cu12; python_version >= '3.9' and platform_system != 'Windows' and platform_machine != 'arm64'
+#faiss-cpu>=1.7.0; python_version >= '3.9' and (platform_system == 'Windows' or platform_machine == 'arm64')
+wordcloud>=1.8.0
+PyPDF2>=2.12.0
+python-Levenshtein>=0.20.9
+spacy>=3.5.0
+arxiv>=1.4.7
+
+# Optional Dependencies for Enhanced Features
+scholarly>=1.7.0  # Google Scholar integration
+semanticscholar  # Semantic Scholar API
+beautifulsoup4>=4.11.0  # HTML parsing
+python-docx>=0.8.11  # DOCX parsing
+requests>=2.28.0  # HTTP requests
+asyncio>=3.4.3  # Async support
+python-louvain>=0.16  # Community detection
+nltk>=3.8.0  # Natural language processing
+pytest>=7.3.1  # Testing
+
+# Specialized Components
+umap-learn>=0.5.3  # Dimensionality reduction
+hdbscan>=0.8.29  # Clustering
+textdistance>=4.5.0  # String similarity
+chromadb>=0.4.0  # Vector store
+pydantic>=2.0.0  # Data validation
+fastapi>=0.95.0  # API framework (if needed)
+uvicorn>=0.22.0  # ASGI server (if needed)
+
+# Visualization
+plotly>=5.14.0  # Interactive visualizations
+bokeh>=3.1.0  # Interactive visualizations
+pygraphviz>=1.10.0; platform_system != 'Windows'  # Graph visualization (optional)
+
+# Download spaCy model
+# Run after installing: python -m spacy download en_core_web_sm 

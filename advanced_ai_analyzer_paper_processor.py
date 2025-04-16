@@ -21,6 +21,7 @@ import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import PyPDF2
 import nltk
+import torch
 
 # Remove NLTK imports
 # import nltk
@@ -113,6 +114,40 @@ class PaperProcessor:
         # Multi-processing settings
         self.max_workers = CONFIG.get('num_workers', 4)
         
+        # New: Initialize section patterns for section extraction
+        self.section_patterns = {
+            'abstract': [r'abstract', r'summary'],
+            'introduction': [r'introduction', r'background', r'overview'],
+            'methodology': [r'method', r'approach', r'algorithm', r'implementation', r'framework'],
+            'results': [r'result', r'experimental result', r'evaluation', r'performance'],
+            'discussion': [r'discussion', r'analysis', r'limitation'],
+            'conclusion': [r'conclusion', r'future work', r'future direction'],
+            'references': [r'reference', r'bibliography']
+        }
+        
+        # New: Initialize section classifier for paper structure understanding
+        try:
+            # Use a lightweight model that can classify academic paper sections
+            self.section_classifier = None
+            if CONFIG.get('use_section_classifier', True):
+                # Import only if needed
+                from transformers import AutoModelForSequenceClassification, AutoTokenizer
+                section_model_name = CONFIG.get('section_classifier_model', 'allenai/scibert_scivocab_uncased')
+                self.section_classifier_tokenizer = AutoTokenizer.from_pretrained(section_model_name)
+                self.section_classifier = AutoModelForSequenceClassification.from_pretrained(
+                    section_model_name, 
+                    num_labels=len(self.section_patterns),
+                    id2label={i: label for i, label in enumerate(self.section_patterns.keys())},
+                    label2id={label: i for i, label in enumerate(self.section_patterns.keys())}
+                )
+                self.section_classifier.eval()  # Set to evaluation mode
+                if torch.cuda.is_available():
+                    self.section_classifier.to('cuda')
+                logger.info(f"Loaded section classifier model: {section_model_name}")
+        except Exception as e:
+            logger.warning(f"Failed to load section classifier: {e}. Will use rule-based section detection.")
+            self.section_classifier = None
+        
         logger.info(f"Initialized PaperProcessor with embedding model {self.embedding_manager.embedding_model}")
 
     def _extract_text_from_pdf(self, filepath):
@@ -193,58 +228,132 @@ class PaperProcessor:
         # Delegate to embedding manager
         return self.embedding_manager.get_embedding_for_text(text)
     
-    def process_paper(self, paper_data):
-        """Process a single paper with advanced embedding generation
+    def process_paper(self, paper_data, file_path=None):
+        """Process a paper, extracting key information.
         
         Args:
-            paper_data (dict): Paper metadata with filepath
+            paper_data (dict): Paper metadata
+            file_path (str, optional): Path to PDF file to extract text from
             
         Returns:
-            dict: Processed paper with extracted features
+            dict: Processed paper data with extracted information
         """
-        if not paper_data or 'filepath' not in paper_data:
-            logger.warning("Invalid paper data for processing")
-            return None
+        # Initialize a minimal result dictionary to ensure we always return valid data
+        result = {
+            "paper_id": None,
+            "title": "",
+            "abstract": "",
+            "full_text": "",
+            "status": "error",
+            "errors": []
+        }
+        
+        # Input validation
+        if not isinstance(paper_data, dict):
+            error_msg = f"Expected paper_data to be a dictionary, got {type(paper_data)}"
+            logger.error(error_msg)
+            result["errors"].append(error_msg)
+            return result
             
+        # Ensure paper_id exists
+        if "paper_id" not in paper_data:
+            error_msg = "Missing paper_id in paper_data"
+            logger.error(error_msg)
+            result["errors"].append(error_msg)
+            return result
+            
+        # Update basic fields from paper_data
+        result["paper_id"] = paper_data.get("paper_id")
+        result["title"] = paper_data.get("title", "")
+        result["abstract"] = paper_data.get("abstract", "")
+        
+        # Extract text from PDF if file_path is provided
+        text = ""
+        if file_path:
+            try:
+                text = self._extract_text_from_pdf(file_path)
+                if not text.strip():
+                    error_msg = f"Empty text extracted from {file_path}"
+                    logger.warning(error_msg)
+                    result["errors"].append(error_msg)
+            except Exception as e:
+                error_msg = f"Failed to extract text from PDF {file_path}: {str(e)}"
+                logger.error(error_msg)
+                result["errors"].append(error_msg)
+        
+        # If we have paper_data with full_text, use that
+        if "full_text" in paper_data and paper_data["full_text"]:
+            text = paper_data["full_text"]
+            
+        # Update the result with the extracted text
+        result["full_text"] = text
+        
+        # Process the paper data and text with robust error handling
         try:
-            # Extract text from PDF
-            paper_text = self._extract_text_from_pdf(paper_data['filepath'])
+            # Generate embeddings
+            embeddings = {}
+            try:
+                if text and self.embedding_manager:
+                    embeddings = self.generate_embedding(text)
+                    result["embeddings"] = embeddings
+            except Exception as e:
+                error_msg = f"Failed to generate embeddings: {str(e)}"
+                logger.error(error_msg)
+                result["errors"].append(error_msg)
             
-            if not paper_text:
-                logger.warning(f"Empty text extracted from {paper_data.get('id', 'unknown')}")
-                return None
+            # Extract sections
+            try:
+                sections = self.extract_sections(text)
+                result["sections"] = sections
+            except Exception as e:
+                error_msg = f"Failed to extract sections: {str(e)}"
+                logger.error(error_msg)
+                result["errors"].append(error_msg)
+                result["sections"] = []
+            
+            # Extract concepts
+            try:
+                concepts = self.extract_concepts(text)
+                result["concepts"] = concepts
+            except Exception as e:
+                error_msg = f"Failed to extract concepts: {str(e)}"
+                logger.error(error_msg)
+                result["errors"].append(error_msg)
+                result["concepts"] = []
+            
+            # Extract code snippets
+            try:
+                code_snippets = self.extract_code_snippets(text)
+                result["code_snippets"] = code_snippets
+            except Exception as e:
+                error_msg = f"Failed to extract code snippets: {str(e)}"
+                logger.error(error_msg)
+                result["errors"].append(error_msg)
+                result["code_snippets"] = []
+            
+            # Extract references
+            try:
+                references = self.extract_references(text)
+                result["references"] = references
+            except Exception as e:
+                error_msg = f"Failed to extract references: {str(e)}"
+                logger.error(error_msg)
+                result["errors"].append(error_msg)
+                result["references"] = []
+            
+            # Update status if we got this far without critical errors
+            if not result["errors"]:
+                result["status"] = "success"
+            else:
+                # Non-critical errors still allow partial success
+                result["status"] = "partial"
                 
-            # Generate embedding for full text
-            embedding = self.generate_embedding(paper_text)
-            
-            # Extract concepts from text
-            concepts = self._extract_concepts(paper_text)
-            
-            # Combine all data
-            processed_paper = {
-                'id': paper_data.get('id'),
-                'title': paper_data.get('title', ''),
-                'embedding': embedding,
-                'concepts': concepts,
-                'metadata': {
-                    'authors': paper_data.get('authors', []),
-                    'categories': paper_data.get('categories', []),
-                    'published': paper_data.get('published', ''),
-                    'updated': paper_data.get('updated', ''),
-                    'entry_id': paper_data.get('entry_id', ''),
-                    'pdf_url': paper_data.get('pdf_url', '')
-                }
-            }
-            
-            # Add abstract if available
-            if 'abstract' in paper_data:
-                processed_paper['abstract'] = paper_data['abstract']
-            
-            return processed_paper
-            
         except Exception as e:
-            logger.error(f"Error processing paper {paper_data.get('id', 'unknown')}: {e}")
-            return None
+            error_msg = f"Unexpected error processing paper: {str(e)}"
+            logger.error(error_msg)
+            result["errors"].append(error_msg)
+            
+        return result
     
     def process_papers_batch(self, papers_metadata):
         """Process a batch of papers in parallel
@@ -274,7 +383,7 @@ class PaperProcessor:
                     if processed_paper:
                         processed_papers.append(processed_paper)
                 except Exception as e:
-                    logger.error(f"Error in paper processing task for {paper.get('id', 'unknown')}: {e}")
+                    logger.error(f"Error in paper processing task for {paper.get('paper_id', 'unknown')}: {e}")
         
         logger.info(f"Processed {len(processed_papers)} papers out of {len(papers_metadata)} submitted")
         
@@ -362,15 +471,15 @@ class PaperProcessor:
             
             # Prepare metadata
             meta = {
-                'id': paper_id_raw,
+                'paper_id': paper_id_raw,
                 'filepath': filepath,
                 'title': paper.title,
                 'abstract': paper.summary,
                 'authors': [str(a) for a in paper.authors],
-                'published': paper.published.isoformat(),
+                'year': paper.published.isoformat(),
                 'updated': paper.updated.isoformat(),
                 'categories': paper.categories,
-                'pdf_url': paper.pdf_url,
+                'url': paper.pdf_url,
                 'entry_id': paper.entry_id
             }
             
@@ -414,15 +523,25 @@ class PaperProcessor:
     # ADD new preprocess_text using spaCy
     def preprocess_text(self, text):
         """Preprocess text using spaCy for lemmatization and stopword removal."""
-        if not text or self.nlp is None:
-            # Log warning if spaCy isn't available but we expected it
-            if not text: logger.debug("Cannot preprocess empty text.")
-            if self.nlp is None: logger.warning("spaCy model not available for preprocessing.")
-            return [] # Return empty list if no text or no spaCy model
+        if not text:
+            logger.debug("Cannot preprocess empty text.")
+            # Return minimal valid token list instead of empty list
+            return ["placeholder"]
+        
         try:
             # Process text with spaCy - consider increasing max_length if needed for long papers
-            # self.nlp.max_length = len(text) + 100 # Uncomment if hitting length limits
-            doc = self.nlp(text.lower()) # Process in lowercase
+            if self.nlp is None:
+                logger.warning("spaCy model not available for preprocessing, using fallback tokenization.")
+                # Fallback to basic preprocessing if spaCy is not available
+                tokens = nltk.word_tokenize(text.lower())
+                tokens = [token for token in tokens 
+                         if token not in self.stopwords 
+                         and not token.isdigit()
+                         and len(token) > CONFIG.get('min_token_length', 2)]
+                return tokens if tokens else ["placeholder"]
+            
+            # Process text with spaCy
+            doc = self.nlp(text.lower())
 
             # Lemmatize, remove stopwords, punctuation, and short tokens
             processed_tokens = [
@@ -431,95 +550,100 @@ class PaperProcessor:
                 if not token.is_stop
                 and not token.is_punct
                 and not token.is_space
-                and len(token.lemma_) > CONFIG.get('min_token_length', 2) # Configurable min length
+                and len(token.lemma_) > CONFIG.get('min_token_length', 2)
             ]
+            
             # Basic check if processing yielded any result
             if not processed_tokens:
-                 logger.warning("Preprocessing resulted in empty token list.")
+                logger.warning("Preprocessing resulted in empty token list, using fallback.")
+                # Return token from raw text as fallback
+                raw_tokens = text.lower().split()
+                filtered_tokens = [t for t in raw_tokens if len(t) > 2 and not t.isdigit()]
+                return filtered_tokens if filtered_tokens else ["placeholder"]
+            
             return processed_tokens
         except ValueError as e:
-             # Handle potential spaCy length limit errors
-             if "is greater than the model's maximum attribute" in str(e):
-                  logger.error(f"Text length ({len(text)}) exceeds spaCy model's max length. Truncating or increase max_length. Error: {e}")
-                  # Option: Truncate text and retry?
-                  # Option: Increase self.nlp.max_length (might need more RAM)?
-                  # For now, return empty list to signal failure.
-                  return []
-             else:
-                 logger.error(f"SpaCy preprocessing failed with ValueError: {e}")
-                 return [] # Fallback
+            # Handle potential spaCy length limit errors
+            if "is greater than the model's maximum attribute" in str(e):
+                logger.error(f"Text length ({len(text)}) exceeds spaCy model's max length. Truncating.")
+                # Truncate text and use basic tokenization
+                truncated_text = text[:self.nlp.max_length-1000] if hasattr(self.nlp, 'max_length') else text[:100000]
+                tokens = nltk.word_tokenize(truncated_text.lower())
+                tokens = [token for token in tokens 
+                        if token not in self.stopwords 
+                        and not token.isdigit()
+                        and len(token) > CONFIG.get('min_token_length', 2)]
+                return tokens if tokens else ["placeholder"]
+            else:
+                logger.error(f"SpaCy preprocessing failed with ValueError: {e}")
+                # Fallback to simple tokenization
+                tokens = text.lower().split()
+                return tokens if tokens else ["placeholder"]
         except Exception as e:
-             logger.error(f"SpaCy preprocessing failed: {e}")
-             # Fallback to simple split?
-             return text.lower().split() # Very basic fallback
+            logger.error(f"SpaCy preprocessing failed: {e}")
+            # Fallback to simple split
+            tokens = text.lower().split()
+            return tokens if tokens else ["placeholder"]
 
     def extract_concepts(self, processed_tokens, top_n=CONFIG.get('top_n_concepts', 50)):
         """Extract key concepts using TF-IDF on preprocessed tokens."""
-        # Remove the internal call to self.preprocess(text)
-        # Remove the logic handling short text or using original text
-
         if not processed_tokens:
             logger.warning("Cannot extract concepts from empty token list.")
-            return []
-
+            return ["no_concept_extracted"]  # Return a placeholder concept instead of empty list
+        
         try:
             # Use a combination of TF-IDF and domain-specific keyword extraction
-            # 1. TF-IDF for statistical importance
             # Join tokens back into a single string for TF-IDF
             text_for_tfidf = ' '.join(processed_tokens)
-            if not text_for_tfidf.strip(): # Check if joined text is empty
-                 return []
+            if not text_for_tfidf.strip():  # Check if joined text is empty
+                logger.warning("Empty text for TF-IDF, returning default concepts.")
+                return ["no_concept_extracted"]
             
             # Fit TF-IDF on the single processed document
-            # Consider if fitting on a larger corpus is needed for better IDF scores
-            tfidf_matrix = self.tfidf_vectorizer.fit_transform([text_for_tfidf])
-            feature_names = self.tfidf_vectorizer.get_feature_names_out()
-            scores = tfidf_matrix.toarray().flatten()
-            term_scores = list(zip(feature_names, scores))
-            
-            # Remove sorting/filtering logic previously done on paragraphs if no longer needed
-            # Keep keyword weighting for domain relevance?
-
-            # 2. Add domain-specific keyword weighting (Optional but potentially useful)
-            weighted_scores = []
-            domain_keywords = CONFIG.get('domain_keywords', {
-                # Default keywords if not in config
-                'algorithm', 'model', 'method', 'framework', 'neural', 'network',
-                'deep', 'learning', 'transformer', 'attention', 'embedding', 
-                'training', 'inference', 'evaluation', 'loss', 'gradient' 
-            })
-            keyword_boost = CONFIG.get('keyword_boost', 1.5)
-            ngram_boost = CONFIG.get('ngram_boost', 1.2)
-
-            for term, score in term_scores:
-                boost = 1.0
-                # Boost terms that ARE domain-specific keywords
-                if term in domain_keywords:
-                    boost *= keyword_boost
-                # Boost multi-word terms (TF-IDF ngrams handle this)
-                if ' ' in term:
-                    boost *= ngram_boost
-                weighted_scores.append((term, score * boost))
-
-            # Sort by weighted score
-            sorted_terms = sorted(weighted_scores, key=lambda x: x[1], reverse=True)
-
-            # Filter out terms with very low scores
-            min_score_threshold = CONFIG.get('min_concept_score', 0.01)
-            important_terms = [term for term, score in sorted_terms if score > min_score_threshold]
-
-            # Return top N terms
-            return important_terms[:top_n]
-
-        except Exception as e:
-            logger.error(f"TF-IDF concept extraction failed: {e}")
-            # Fallback: Use simple frequency count on tokens
             try:
+                tfidf_matrix = self.tfidf_vectorizer.fit_transform([text_for_tfidf])
+                feature_names = self.tfidf_vectorizer.get_feature_names_out()
+                scores = tfidf_matrix.toarray().flatten()
+                term_scores = list(zip(feature_names, scores))
+                
+                # Add domain-specific keyword weighting
+                weighted_scores = []
+                domain_keywords = CONFIG.get('domain_keywords', {
+                    'algorithm', 'model', 'method', 'framework', 'neural', 'network',
+                    'deep', 'learning', 'transformer', 'attention', 'embedding', 
+                    'training', 'inference', 'evaluation', 'loss', 'gradient' 
+                })
+                keyword_boost = CONFIG.get('keyword_boost', 1.5)
+                ngram_boost = CONFIG.get('ngram_boost', 1.2)
+
+                for term, score in term_scores:
+                    boost = 1.0
+                    if term in domain_keywords:
+                        boost *= keyword_boost
+                    if ' ' in term:
+                        boost *= ngram_boost
+                    weighted_scores.append((term, score * boost))
+
+                # Sort by weighted score
+                sorted_terms = sorted(weighted_scores, key=lambda x: x[1], reverse=True)
+
+                # Filter out terms with very low scores
+                min_score_threshold = CONFIG.get('min_concept_score', 0.01)
+                important_terms = [term for term, score in sorted_terms if score > min_score_threshold]
+
+                # Return top N terms, or placeholder if no terms found
+                return important_terms[:top_n] if important_terms else ["no_concept_extracted"]
+            except Exception as e:
+                logger.warning(f"TF-IDF extraction failed: {e}, using fallback method.")
+                # Fallback to frequency counting
                 counts = Counter(processed_tokens)
-                return [term for term, _ in counts.most_common(top_n)]
-            except Exception as e2:
-                 logger.error(f"Concept extraction fallback failed: {e2}")
-                 return []
+                terms = [term for term, _ in counts.most_common(top_n)]
+                return terms if terms else ["no_concept_extracted"]
+            
+        except Exception as e:
+            logger.error(f"Concept extraction failed: {e}")
+            # Return a placeholder concept to avoid empty lists
+            return ["no_concept_extracted"]
 
     def generate_embedding(self, text):
         """Generate embedding using Sentence Transformer.
@@ -614,7 +738,7 @@ class PaperProcessor:
              futures = {}
              for paper_meta in papers_metadata:
                   filepath = paper_meta.get('filepath')
-                  paper_id = paper_meta.get('id')
+                  paper_id = paper_meta.get('paper_id')
                   if filepath and paper_id:
                        # Submit text extraction task
                        futures[executor.submit(self._extract_text_from_pdf, filepath)] = paper_id
@@ -643,7 +767,7 @@ class PaperProcessor:
         logger.info("Preprocessing text and extracting concepts...")
         
         # Map paper_id to original metadata for easy access
-        meta_map = {p['id']: p for p in papers_metadata}
+        meta_map = {p['paper_id']: p for p in papers_metadata}
 
         for paper_id, meta in tqdm(meta_map.items(), desc="Preprocessing/Concepts"):
              # Use extracted text if available, otherwise fallback to abstract
@@ -704,7 +828,7 @@ class PaperProcessor:
         # --- Step 4: Assemble Results --- 
         logger.info("Assembling processed paper data...")
         for paper_meta in papers_metadata:
-            paper_id = paper_meta.get('id')
+            paper_id = paper_meta.get('paper_id')
             if not paper_id: continue # Skip if metadata has no ID
             
             # Include paper even if some steps failed, but mark data as potentially incomplete
@@ -713,10 +837,17 @@ class PaperProcessor:
             extracted_text = texts_to_process.get(paper_id)
             
             processed_paper = {
-                'id': paper_id,
-                'metadata': paper_meta, 
-                'concepts': concepts_map.get(paper_id, []), # Use concepts if available
-                'embedding': embedding_list, 
+                'paper_id': paper_id,
+                'title': paper_meta.get('title', ''),
+                'abstract': paper_meta.get('abstract', ''),
+                'authors': paper_meta.get('authors', []),
+                'year': paper_meta.get('year', ''),
+                'url': paper_meta.get('url', ''),
+                'extracted_text': extracted_text,
+                'embedding': embedding_list,
+                'sections': self.extract_sections(extracted_text),
+                'concepts': concepts_map.get(paper_id, []),
+                'references': self.extract_references(extracted_text),
                 'has_full_text': extracted_text is not None,
                 'processed_timestamp': time.time()
             }
@@ -818,65 +949,196 @@ class PaperProcessor:
         
         return self.citation_graph, self.inverse_citation_graph
     
-    def augment_text(self, text):
-        """Augment text through sentence reordering and synonym replacement
+    def augment_text(self, text, augmentation_level=CONFIG.get('augmentation_level', 1)):
+        """
+        Augment text with synonyms from WordNet.
         
         Args:
             text (str): Text to augment
+            augmentation_level (int): Level of augmentation (1-3)
             
         Returns:
             str: Augmented text
         """
-        if not text or random.random() > self.augmentation_probability:
+        if not text or augmentation_level <= 0:
             return text
         
-        # Split into sentences
-        sentences = nltk.sent_tokenize(text)
-        if len(sentences) <= 3:
-            return text
-        
-        # Random augmentation type
-        aug_type = random.choice(['reorder', 'synonym', 'both'])
-        
-        if aug_type in ['reorder', 'both']:
-            # Reorder some sentences (keep first and last stable)
-            reorder_start = 1
-            reorder_end = max(2, len(sentences) - 1)
+        try:
+            if self.nlp is None:
+                logger.warning("spaCy model not available for text augmentation.")
+                return text
             
-            middle_sentences = sentences[reorder_start:reorder_end]
-            random.shuffle(middle_sentences)
+            doc = self.nlp(text)
+            augmented_tokens = []
             
-            sentences = sentences[:reorder_start] + middle_sentences + sentences[reorder_end:]
-        
-        if aug_type in ['synonym', 'both'] and self.nlp:
-            # Replace some words with synonyms
-            for i in range(len(sentences)):
-                if random.random() < 0.5:  # Only apply to some sentences
-                    doc = self.nlp(sentences[i])
-                    new_words = []
+            for token in doc:
+                # Skip stopwords, punctuation, etc.
+                if token.is_stop or token.is_punct or token.is_space or token.is_digit:
+                    augmented_tokens.append(token.text)
+                    continue
                     
-                    for token in doc:
-                        if token.pos_ in ['NOUN', 'VERB', 'ADJ'] and random.random() < 0.2:
-                            # Try to find a synonym
-                            synsets = nltk.wordnet.wordnet.synsets(token.text)
-                            if synsets:
-                                synonyms = []
-                                for synset in synsets:
-                                    for lemma in synset.lemmas():
-                                        synonym = lemma.name().replace('_', ' ')
-                                        if synonym != token.text:
-                                            synonyms.append(synonym)
+                # For content words, add synonyms based on augmentation level
+                if token.pos_ in ['NOUN', 'VERB', 'ADJ', 'ADV']:
+                    try:
+                        # Fix: Use correct path to WordNet synsets
+                        synsets = nltk.corpus.wordnet.synsets(token.text)
+                        if synsets and random.random() < 0.3:  # Only augment some words
+                            # Get synonyms from WordNet
+                            synonyms = []
+                            for synset in synsets[:augmentation_level]:
+                                synonyms.extend([lemma.name() for lemma in synset.lemmas()])
                                 
-                                if synonyms:
-                                    new_words.append(random.choice(synonyms))
-                                    continue
-                        
-                        new_words.append(token.text)
-                    
-                    sentences[i] = ' '.join(new_words)
+                            # Remove duplicates and original word
+                            synonyms = list(set(synonyms))
+                            if token.text in synonyms:
+                                synonyms.remove(token.text)
+                                
+                            # Choose a random synonym to replace the original word
+                            if synonyms:
+                                synonym = random.choice(synonyms)
+                                # Replace underscores with spaces (WordNet format)
+                                synonym = synonym.replace('_', ' ')
+                                augmented_tokens.append(synonym)
+                                continue
+                    except Exception as e:
+                        logger.debug(f"Error getting synonyms for '{token.text}': {e}")
+                
+                # If no synonym found or not eligible for augmentation, use original token
+                augmented_tokens.append(token.text)
+                
+            # Join tokens back into text
+            augmented_text = ' '.join(augmented_tokens)
+            return augmented_text
+        except Exception as e:
+            logger.error(f"Text augmentation failed: {e}")
+            return text  # Return original text if augmentation fails
+
+    def extract_references(self, text):
+        """
+        Extract bibliographic references from paper text.
         
-        return ' '.join(sentences)
-    
+        Args:
+            text (str): The full paper text
+            
+        Returns:
+            list: List of extracted references
+        """
+        if not text:
+            logger.warning("Cannot extract references from empty text.")
+            return []
+        
+        # Initialize references list
+        references = []
+        
+        try:
+            # First approach: Look for a "References" section
+            sections = self.extract_sections(text)
+            references_section = None
+            
+            # Find the references section by looking for common reference section titles
+            reference_section_titles = [
+                "references", "bibliography", "works cited", "literature cited"
+            ]
+            
+            for section_title, section_content in sections.items():
+                if section_title.lower() in reference_section_titles:
+                    references_section = section_content
+                    break
+            
+            if references_section:
+                # Split the references section into individual entries
+                # References are typically separated by newlines or numbered
+                reference_entries = re.split(r'\n\s*\n|\[\d+\]|\n\d+\.|\n\s*•', references_section)
+                
+                # Clean and process each entry
+                for entry in reference_entries:
+                    entry = entry.strip()
+                    if not entry:
+                        continue
+                    
+                    # Skip entries that are too short (likely not references)
+                    if len(entry) < 20:
+                        continue
+                    
+                    # Build a structured reference for each entry
+                    ref = {
+                        "text": entry,
+                        "title": None,
+                        "authors": None,
+                        "year": None
+                    }
+                    
+                    # Try to extract paper title - usually in quotes or italics
+                    title_match = re.search(r'[""]([^""]+)[""]|["\'"]([^"\'"]+)["\'""]|[""](.*?)["""]', entry)
+                    if title_match:
+                        title = next(group for group in title_match.groups() if group is not None)
+                        ref["title"] = title.strip()
+                    
+                    # Try to extract year - usually in parentheses
+                    year_match = re.search(r'\((\d{4}[a-z]?)\)|\b((?:19|20)\d{2}[a-z]?)\b', entry)
+                    if year_match:
+                        year = next(group for group in year_match.groups() if group is not None)
+                        ref["year"] = year.strip()
+                    
+                    # Try to extract authors - typically at the beginning of the reference
+                    # This is complex due to various formats, so a simple approach is used
+                    if title_match:
+                        # Authors are typically before the title
+                        title_start = title_match.start()
+                        authors_text = entry[:title_start].strip()
+                        # Remove punctuation at the end
+                        authors_text = re.sub(r'[,.;:]$', '', authors_text)
+                        if authors_text:
+                            ref["authors"] = authors_text
+                    
+                    references.append(ref)
+            
+            # Second approach: If no references section found, try to find citations in the text
+            if not references:
+                # Look for common citation patterns
+                # Harvard style: (Author, Year)
+                harvard_citations = re.findall(r'\(([A-Z][a-z]+(?:\s+and\s+[A-Z][a-z]+)*),\s+(\d{4}[a-z]?)\)', text)
+                # IEEE style: [number]
+                ieee_citations = re.findall(r'\[(\d+)\]', text)
+                
+                # Process Harvard style citations
+                for author, year in harvard_citations:
+                    references.append({
+                        "text": f"({author}, {year})",
+                        "authors": author,
+                        "year": year,
+                        "title": None
+                    })
+                
+                # Process IEEE style citations (limited information)
+                for ref_num in ieee_citations:
+                    ref_text = f"[{ref_num}]"
+                    # Try to find the actual reference in the text
+                    ref_pattern = rf'\[{ref_num}\]\s+([^\[\]]+?)(?=\[\d+\]|\n\n|\Z)'
+                    ref_match = re.search(ref_pattern, text)
+                    if ref_match:
+                        ref_text = ref_match.group(1).strip()
+                    
+                    references.append({
+                        "text": ref_text,
+                        "reference_number": ref_num
+                    })
+            
+            # Remove duplicates while preserving order
+            unique_refs = []
+            seen_texts = set()
+            for ref in references:
+                ref_text = ref["text"]
+                if ref_text not in seen_texts:
+                    seen_texts.add(ref_text)
+                    unique_refs.append(ref)
+            
+            return unique_refs
+        
+        except Exception as e:
+            logger.error(f"Reference extraction failed: {e}")
+            return []
+
     def process_paper_with_augmentation(self, paper_metadata):
         """Process a paper with data augmentation
         
@@ -894,8 +1156,8 @@ class PaperProcessor:
             processed_paper['augmented_abstract'] = self.augment_text(processed_paper['abstract'])
         
         # Extract code snippets
-        if 'full_text' in processed_paper:
-            code_snippets = self.extract_code_snippets(processed_paper['full_text'])
+        if 'extracted_text' in processed_paper:
+            code_snippets = self.extract_code_snippets(processed_paper['extracted_text'])
             processed_paper['code_snippets'] = code_snippets
             
             # Generate code embeddings
@@ -949,3 +1211,150 @@ class PaperProcessor:
                 paper['cites'] = list(self.citation_graph.get(paper_id, set()))
         
         return processed_papers
+
+    # Add new method for section extraction and classification
+    def extract_sections(self, text):
+        """Extract and classify sections from a scientific paper
+        
+        Args:
+            text (str): Full text of the paper
+            
+        Returns:
+            dict: Dictionary of section name to section text
+        """
+        if not text:
+            return {}
+            
+        # First try to identify sections by common headings and patterns
+        sections = {}
+        
+        # Split by potential section headings (patterns like "1. Introduction", "II. Methods", etc.)
+        section_splits = re.split(r'\n\s*(?:\d+\.|\d+\s+|[IVX]+\.\s+|\[.*?\]\s+)?([A-Z][A-Za-z\s]+)(?:\s*\n|:)', text)
+        
+        # If we have a clean split with headings
+        if len(section_splits) > 1:
+            # Process the splits into sections
+            for i in range(1, len(section_splits), 2):
+                if i < len(section_splits) - 1:
+                    heading = section_splits[i].strip().lower()
+                    content = section_splits[i+1].strip()
+                    
+                    # Map the heading to standardized section names
+                    for section_name, patterns in self.section_patterns.items():
+                        if any(pattern in heading for pattern in patterns):
+                            sections[section_name] = content
+                            break
+                    else:
+                        # If no known section pattern matched, use the heading as is
+                        sections[heading] = content
+        
+        # If section detection by headings failed, try paragraph-based approach
+        if not sections:
+            # Split into paragraphs
+            paragraphs = re.split(r'\n\s*\n', text)
+            
+            if self.section_classifier and len(paragraphs) > 0:
+                # Use transformer model to classify paragraphs into sections
+                for para in paragraphs:
+                    if len(para.strip()) < 50:  # Skip very short paragraphs
+                        continue
+                        
+                    # Classify paragraph
+                    with torch.no_grad():
+                        inputs = self.section_classifier_tokenizer(
+                            para[:512],  # Limit to model's max length
+                            return_tensors="pt",
+                            truncation=True,
+                            padding=True
+                        )
+                        
+                        if torch.cuda.is_available():
+                            inputs = {k: v.to('cuda') for k, v in inputs.items()}
+                            
+                        outputs = self.section_classifier(**inputs)
+                        predictions = outputs.logits.argmax(dim=-1)
+                        section_name = list(self.section_patterns.keys())[predictions.item()]
+                        
+                        # Append to section if it exists, otherwise create it
+                        if section_name in sections:
+                            sections[section_name] += " " + para
+                        else:
+                            sections[section_name] = para
+            else:
+                # Fallback to simple heuristics if classifier isn't available
+                # Abstract is usually first
+                if paragraphs and len(paragraphs) > 0:
+                    sections["abstract"] = paragraphs[0]
+                    
+                # Last portion often contains references
+                if paragraphs and len(paragraphs) > 2:
+                    sections["references"] = paragraphs[-1]
+                    
+                # Middle paragraphs are likely methodology and results
+                if paragraphs and len(paragraphs) > 3:
+                    middle_idx = len(paragraphs) // 2
+                    sections["methodology"] = " ".join(paragraphs[1:middle_idx])
+                    sections["results"] = " ".join(paragraphs[middle_idx:-1])
+        
+        return sections
+    
+    # Add method for handling multiple document formats
+    def extract_text_from_document(self, filepath):
+        """Extract text from various document formats (PDF, DOCX, HTML, TXT)
+        
+        Args:
+            filepath (str): Path to the document
+            
+        Returns:
+            str: Extracted text
+        """
+        if not os.path.exists(filepath):
+            logger.warning(f"Document file does not exist: {filepath}")
+            return ""
+            
+        # Determine file type based on extension
+        file_ext = os.path.splitext(filepath)[1].lower()
+        
+        try:
+            if file_ext == '.pdf':
+                return self._extract_text_from_pdf(filepath)
+            elif file_ext == '.docx':
+                # Use python-docx for DOCX files
+                try:
+                    import docx
+                    doc = docx.Document(filepath)
+                    return '\n\n'.join([para.text for para in doc.paragraphs])
+                except ImportError:
+                    logger.warning("python-docx not installed. Cannot process DOCX files.")
+                    return ""
+            elif file_ext == '.html' or file_ext == '.htm':
+                # Use BeautifulSoup for HTML files
+                try:
+                    from bs4 import BeautifulSoup
+                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                        soup = BeautifulSoup(f.read(), 'html.parser')
+                        # Remove script and style elements
+                        for script in soup(["script", "style"]):
+                            script.extract()
+                        # Get text
+                        text = soup.get_text()
+                        # Break into lines and remove leading/trailing space
+                        lines = (line.strip() for line in text.splitlines())
+                        # Break multi-headlines into a line each
+                        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+                        # Drop blank lines
+                        text = '\n'.join(chunk for chunk in chunks if chunk)
+                        return text
+                except ImportError:
+                    logger.warning("BeautifulSoup not installed. Cannot process HTML files.")
+                    return ""
+            elif file_ext == '.txt':
+                # Simple text files
+                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                    return f.read()
+            else:
+                logger.warning(f"Unsupported file format: {file_ext}")
+                return ""
+        except Exception as e:
+            logger.error(f"Error extracting text from {filepath}: {e}")
+            return ""
